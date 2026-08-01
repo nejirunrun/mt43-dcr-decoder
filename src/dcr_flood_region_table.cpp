@@ -4,9 +4,7 @@
 //   40bit（値域が uint32_t の最大値 4.29e9 を超える）＝ここだけコード型が
 //   uint64_t になる（dcr_report.h の DcrFlood::region 参照）。
 //
-// 【出典】azarashi（MIT・nbtk 氏）qzss_dcr_jma_flood_forecast_region.py から
-//   機械抽出（2026-07-30・全392件）。他の表と同じくパーサースクリプトで抽出し、
-//   手転記による事故を避けている。
+// 【出典】IS-QZSS-DCR-016 Table 4.1.2-45（Flood Forecast Region・全392件）。
 // =============================================================================
 #include "dcr_report.h"
 

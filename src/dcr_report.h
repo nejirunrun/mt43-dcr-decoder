@@ -1,63 +1,45 @@
-// dcr_report.h — QZSS 災危通報（DC Report）デコーダ：純関数レイヤ（L1）
+// dcr_report.h — QZSS 災危通報（DC Report）デコーダ：純関数API
 // =============================================================================
-// 【このファイルで何ができるか】
-//   QZSS L1S の 250bit メッセージ（RXM-SFRBX から復元した 32byte）を受け取り、
-//   CRC24 検証 → 共通部の抽出 → カテゴリ別詳細の抽出、までを **純関数** で行う。
+// 【このライブラリでできること】
+//   QZSS L1S の 250bit メッセージ（受信機の RXM-SFRBX 等から復元した 32byte）を
+//   渡すと、CRC24検証 → 共通部の抽出 → カテゴリ別詳細の抽出、を行う。
 //
 //     uint8_t msg[32];                       // L1S 250bit（MSB-first パック済み）
 //     DcrReport r;
-//     if (dcr_decode(msg, r) && r.mt == 43) {
+//     if (dcr_decode(msg, r) && r.jmaValid) {
 //         if (r.category == DCR_CAT_EEW) { DcrEew e; if (dcr_eew(r, e)) { ... } }
 //         if (r.category == DCR_CAT_WEATHER) { DcrWeather w; if (dcr_weather(r, w)) { ... } }
 //     }
 //
-// 【設計判断】
-//  ・**状態を持たない**。時刻も millis() も見ない。入力=32byte、出力=値。
-//    受信経路（GPSControl の診断ループ／本番 gpsUpdate）と、保管（notice_store）と、
-//    表示（display 通知センター）から完全に独立させる＝どこから呼んでも同じ結果になり、
-//    実機なしで検証できる。テレメトリ心臓部へは一切書かない（保全の不変条件）。
+// 【使い方の型（2階建て）】
+//   1. dcr_decode() で共通部（DcrReport: 通報区分・カテゴリ・報告時刻・種別）を得る。
+//   2. r.category を見て、対応する dcr_xxx(r, out) を呼ぶとカテゴリ別詳細
+//      （DcrEew / DcrHypocenter / DcrTsunami 等）が得られる。
+//   3. 構造体の数値フィールドはコードのまま入っているものが多いので、
+//      表示用の文字列が必要なら対応する dcr_xxx_name() で変換する。
 //
-//  ・**DcrReport は raw[32] を丸ごと抱える**。これが「ゴタゴタしても壊れない」ための核。
-//    新しい災害カテゴリ（津波・火山・洪水…）に対応するとき、追加するのは
-//    「DcrXxx 構造体 ＋ dcr_xxx(report, out) 関数」だけで、**DcrReport 自体は変わらない**。
-//    共用体（union）で詳細を抱き込む形にすると、カテゴリを足すたびに構造体レイアウトが
-//    動き、保管層（リング）や表示層まで巻き添えで壊れる。それを構造的に避けている。
-//    ★CLAUDE.md「struct にメンバを追加したらクリーンビルド」の地雷を、そもそも踏まない設計。
+// 【API の設計】
+//  ・**状態を持たない純関数**。入力=32byte、出力=値。時刻や現在時刻を内部で見ない・
+//    グローバル変数を持たない・スレッドセーフ。どこから呼んでも同じ入力には同じ結果を返す。
+//  ・**DcrReport は raw[32] を丸ごと保持する**。新しい災害カテゴリに対応する拡張は
+//    「DcrXxx 構造体 ＋ dcr_xxx(report, out) 関数」を追加するだけで、DcrReport 自体は
+//    変わらない（union で抱き込む設計は取っていない）。
+//  ・**再送の同一判定（contentKey）はデコード済みの意味内容から作る**。生バイトや
+//    CRC24 は同一内容の再送でも値が変わり得るため指紋には使わない。
+//    背景・実測根拠は [DECODER_NOTES.md](../docs/DECODER_NOTES.md) 参照。
 //
-//  ・**重複判定は「デコード済みの意味内容」から作る**（contentKey）。生バイトや CRC24 を
-//    指紋にしてはいけない。理由は2段階で判明した:
-//      ① PAB（プリアンブル）は内容と無関係に巡回し、CRC24 の計算範囲 bit0〜225 の
-//         先頭に含まれる → 素の CRC24 は同一内容でも変わる（2026-07-27 実測）。
-//      ② PAB を除いてもなお、同一内容の MT43 が再送のたびに別値になった（2026-07-28 実測。
-//         熊本の余震の同一通報が3回とも別値）。**MT43 には確定した区切り・長さ・順番が
-//         無く、観測側からその構造を知ることはできない**。「同じ情報がカルーセルして
-//         いるように見える」だけで、ビット列の同一性は保証されていない。
-//    → よって「どのビットをマスクすれば安定するか」を探す方向は原理的に袋小路。
-//      デコードして意味が取れたフィールドだけを材料に鍵を作る（＝下の dcr_content_key）。
-//      これは表示・通知の identity としても正しい粒度になる（人間が「同じ通報だ」と
-//      判断する材料と一致するため）。
+// 【一次資料】
+//   IS-QZSS-DCR-016（内閣府/QZSS）。qzss.go.jp の同意ページ
+//   technical/download/is_qzss_dcr_016_agree.html から入手可能。
+//   ビット配置・コード表の検証記録は [DECODER_NOTES.md](../docs/DECODER_NOTES.md) 参照。
 //
-// 【資料の格付け】★2026-07-30 明確化（ユーザー指摘）
-//   ・**一次資料 = IS-QZSS-DCR-016（内閣府/QSS）**。これだけが規範。
-//     入手経路: qzss.go.jp の同意ページ technical/download/is_qzss_dcr_016_agree.html
-//     → PDF 直リンク（en/technical/download/pdf/ps-is-qzss/is-qzss-dcr-016.pdf）
-//     併せて「訓練／試験メッセージ 配信情報の詳細」（月次PDF）も一次資料。
-//   ・**azarashi（MIT・nbtk 氏）は第三者実装＝傍証**であって一次資料ではない。
-//     ビット配置の突き合わせ相手として有用だが、食い違ったら一次資料が勝つ。
-//     ★旧コメントは「azarashi と照合済み＝検証済み」と読める書き方をしていたが、
-//       これは資料の格付けを誤った表現だったので改めた。実際 Rc の対応表は
-//       azarashi が正しく我々が誤っていた（README 落とし穴⑤）。
-//   EEW のビット配置は azarashi qzss_dcr_decoder_jma_earthquake_early_warning.py と照合
-//   （2026-07-28）。47/50/53/80/96/105/112/122/126/130 が隙間なく連続することを確認済み。
-//
-// 【利用条件】⚠ 災危通報の**内容を UI に表示する**場合、内閣府/QSS の
+// 【利用条件】⚠ 災危通報の**内容を UI に表示する**場合、内閣府/QZSS の
 //   「Additional Terms of Use」により免責事項＋追加利用条件の表示義務がある。
-//   デコードだけなら発生しないが、通知センターへ載せる段階（B5）で必ず対応すること。
+//   デコードのみ（内部処理）であれば発生しない。
 //
 // 【関連ファイル】
-//   dcr_report.cpp                 : 本ヘッダの実装（値テーブルもここ）
-//   ../GPSControl.cpp dumpDcrLoop(): 診断用の受信ループ（本モジュールの最初の消費者）
-//   ../../../notice_store/         : L2 通知内容ストア（B2 で新設予定・未実装）
+//   dcr_report.cpp : 本ヘッダの実装（値テーブルもここ）
+//   docs/DECODER_NOTES.md : 設計判断・実測で踏んだ落とし穴（開発経緯）
 // =============================================================================
 #pragma once
 #include <cstdint>
@@ -87,32 +69,23 @@ enum DcrCategory : uint8_t {
 struct DcrReport {
     bool     valid;          // CRC24 一致かつ MT43/44 かつ PAB 正当
     bool     jmaValid;       // mt==43（JMA 本報）＝以下の共通部フィールドが有効
-    uint8_t  mt;             // 43=JMA 本報 / 44=DCX（他機関）
-    // Rc 3bit: 1=最優先 2=優先 3=通常 7=訓練/試験（0,4,5,6 は仕様上未割当）
-    //   ★JMA 自身による緊急度の判断であり、捨ててはいけない重要情報
-    //     （最優先は通常の20倍の頻度で再送される＝IS-QZSS-DCR-016 Table 4.1.1-1）。
-    //     訓練/試験(7)は優先度の序列の外にある別軸のマーカー。詳細は
-    //     dcr_report.cpp の dcr_classification_name() 冒頭コメント（1つズレ事故の碑文）。
+    uint8_t  mt;             // 43=JMA 本報 / 44=DCX（他機関。共通部より先は未デコード）
+    // Rc 3bit: 通報区分（JMA自身による緊急度の判断）。
+    //   1=最優先 2=優先 3=通常 7=訓練/試験（0,4,5,6 は仕様上未割当）。
+    //   最優先は通常より高頻度で再送される。訓練/試験(7)は優先度の序列とは別軸のマーカー。
     uint8_t  classification;
-    uint8_t  category;       // Dc 4bit（DcrCategory）
-    // At 報告時刻。★**UTC で入っている**（実測で確定・2026-07-28: 受信した全通報が
-    //   例外なく日本時間から9時間遅れており、14:06 の通報を 23:06 JST に受信した）。
-    //   ここは電文に忠実な生の値を保持し、表示のときだけ dcr_to_jst() で変換する
-    //   （受信直後に足し込むと、生データと突き合わせたときに合わなくなるため）。
+    uint8_t  category;       // Dc 4bit（DcrCategory）。この値で分岐して詳細デコーダを呼ぶ
+    // At 報告時刻。**UTC**（JSTで使うときは dcr_to_jst() で変換する）。
     uint8_t  month, day;
     uint8_t  hour, minute;
     // It 2bit: 0=発表 / 1=訂正 / 2=取消（dcr_info_type_name）。
-    //   ★「取消」が存在することが、DC Report が**イベント列ではなく「いま有効な通報の
-    //     掲示板」**であることの根拠になっている（発表から取消まで載り続ける）。
-    //     詳細は README.md「掲示板モデル」。
     uint8_t  infoType;
-    // 再送の同一判定キー。**デコード済みの意味内容だけ**から作る（設計判断②を参照）。
+    // 再送の同一判定キー。デコード済みの意味内容から作られる（生バイトやCRC24は含まない）。
     //   同一通報の再送 → 同じ値／別の通報 → 別の値。通知の identity にそのまま使える。
-    //   ※詳細デコーダが無いカテゴリは共通部（MT・カテゴリ・報告時刻・種別）のみで作るため
-    //     粒度が粗い＝「同じカテゴリ・同じ報告時刻の別内容」を取り違える理論上の余地が残る。
-    //     カテゴリの詳細デコーダを実装すると自動的に精度が上がる（dcr_content_key を参照）。
+    //   詳細デコーダが無いカテゴリは共通部のみで作るため識別粒度が粗くなる
+    //   （詳細デコーダがあるカテゴリはそのフィールドも材料に含める）。
     uint32_t contentKey;
-    uint8_t  raw[32];        // 250bit 原文。カテゴリ別詳細はここから都度読む（設計判断参照）
+    uint8_t  raw[32];        // 250bit 原文。カテゴリ別詳細デコーダはここから都度読む
 };
 
 // 32byte の L1S メッセージを検証・共通部デコードする。
@@ -121,7 +94,9 @@ struct DcrReport {
 bool dcr_decode(const uint8_t msg[32], DcrReport& out);
 
 // ── 緊急地震速報（category==DCR_CAT_EEW）詳細 ────────────────────────────────
-//   ★「仮定震源要素」(assumptive): 深さ raw==10km かつ マグニチュード raw==10(=M1.0)
+//   座標を持たない。「どこが揺れるか」を対象地域コードで、震度は上下限の予測値で
+//   伝える（観測震度ではない）。地図に置きたい場合は震源(DCR_CAT_HYPOCENTER)を待つ。
+//   「仮定震源要素」(assumptive): 深さ raw==10km かつ マグニチュード raw==10(=M1.0)
 //     のとき、JMA は震源を確定せず PLUM 法等で震度のみ推定している。この場合、
 //     震源・規模の値を額面どおり表示してはいけない（実際の地震は M1.0 ではない）。
 struct DcrEew {
@@ -144,22 +119,15 @@ bool dcr_eew(const DcrReport& r, DcrEew& out);
 bool dcr_eew_has_region(const DcrEew& e, uint8_t regionCode);
 
 // ── 震源（category==DCR_CAT_HYPOCENTER）詳細 ─────────────────────────────────
-//   ★**実座標を積んでいるのはこのカテゴリ**（緊急地震速報ではない・2026-07-28 確認）。
-//     EEW(1) と震源(2) は bit121 まで同一レイアウトで、そこから分岐する:
-//       EEW  … +122 予想震度(上下限) → +130 対象地域80bitビットマップ
-//       震源 … +122 度分秒の実座標 41bit（緯度 1+7+6+6 ／ 経度 1+8+6+6）
-//     つまり EEW は「どこが揺れるか」を地域コードで、震源は「どこで起きたか」を
-//     座標で伝える。用途が違うので両方要る（EEW＝即時警報／震源＝確定情報）。
-//     座標があるためマップへのプロットが可能（将来の route/map 連携の素材）。
+//   実座標を積んでいるのはこのカテゴリ（EEWは座標を持たない）。「どこで起きたか」を
+//   度分秒＋十進度で伝える確定情報。
 //
-//   ★**両者はペア配信ではない**（気象庁の発表基準が別・2026-07-28 確認）:
-//       EEW(1)  … 予測が震度5弱以上 または 長周期地震動階級3以上 → 検知の数秒後
-//       震源(2) … 観測が震度3以上 かつ 津波の心配なし           → 数分後
-//     ＝震度3〜4 の地震は**震源(2)だけ**が来て EEW は来ない（大多数のケース）。
-//     大地震では EEW が先、震源が後から追いつく。よって UI 設計では
-//       ・EEW は座標が無い前提で「地域名＋予想震度」だけで完結させる（地図ピンを待たない）
-//       ・地図ピンは震源(2)が来て初めて置ける＝EEW の続報として遅れて現れる
-//     という非対称を織り込むこと。EEW に座標が来ないのは欠落ではなく設計である。
+//   EEW とはペア配信ではない点に注意（気象庁の発表基準が別）:
+//     EEW  … 予測が震度5弱以上 または 長周期地震動階級3以上 → 検知の数秒後に配信
+//     震源 … 観測が震度3以上 かつ 津波の心配なし           → 数分後に配信
+//   震度3〜4程度の地震は震源だけが来てEEWは来ない（大多数のケース）。逆に大地震では
+//   EEWが先に来て、震源はその後の確定情報として遅れて届く。UI側は「EEWは座標なしで
+//   完結させ、地図ピンは震源が来てから置く」という非同期性を前提に設計すること。
 struct DcrHypocenter {
     uint16_t prevention[3];        // 防災上の留意事項コード（0=以降なし）
     uint8_t  otDay, otHour, otMin; // 地震発生時刻
@@ -212,25 +180,12 @@ struct DcrWeather {
 };
 bool dcr_weather(const DcrReport& r, DcrWeather& out);
 
-// =============================================================================
-// 【2026-07-30 追加：残り7カテゴリの詳細デコーダ】
-//   azarashi（MIT・nbtk氏）の該当 decoder/*.py を実機のソースで直接確認し
-//   （要約AIを介さず生コードを読んだ）、ビット配置を転記した。掲示板モデル上の
-//   分類（状態／履歴）は README「掲示板モデル」の判定基準（専用フィールドに
-//   明示的な終了値があるか）で導いたが、台風・火山・降灰は終了値が無いにも
-//   関わらずユーザー判断で「状態」扱いとした（時間的継続を伴う中間的イベント
-//   という実情を優先・2026-07-30 合意）。dcr_board.cpp 側で全カテゴリ共通の
-//   実測間隔ベースタイムアウトが降板の唯一の手段になる。
-// =============================================================================
-
 // ── 南海トラフ地震関連情報（category==DCR_CAT_NANKAI）詳細 ───────────────────
-//   ★他カテゴリと違い、地域も座標も持たない「テキスト速報」。情報種類コードが
-//     6=調査終了で明示的に終わる＝状態バケツに分類する根拠（README参照）。
-//   text[18] は生バイトのまま持つ。★一次資料 Table 4.1.2-18 に「UTF-8 文字列を
-//     複数ページに分割して送信する」と明記されている（2026-07-30 確認・落とし穴⑧の
-//     解消）。1メッセージ分の18byteだけでは文字境界が保証されないので、このデコーダ
-//     の責務はここまで＝**複数ページを跨いだ結合は dcr_nankai_track が正本**
-//     （台風の実況/予報レグと同じ理由でデコーダ層に持たせない）。
+//   他カテゴリと違い、地域も座標も持たない「テキスト速報」。
+//   text[18] はUTF-8文字列の1ページ分の生バイト。一次資料上、長い文字列は複数
+//   メッセージ（ページ）に分割して送信される。1メッセージ分の18byteだけでは
+//   文字境界が保証されないため、複数ページを跨いだ結合はこのデコーダの責務外
+//   （呼び出し側で pageNumber/totalPage を見て結合すること）。
 struct DcrNankai {
     uint8_t infoSerialCode;   // 4bit: 1〜3=調査中A/B/C 4=巨大地震警戒 5=注意 6=調査終了 15=その他
     uint8_t text[18];         // 見出しテキストの1ページ分（UTF-8・生バイト・8bit×18）
@@ -240,9 +195,7 @@ struct DcrNankai {
 bool dcr_nankai(const DcrReport& r, DcrNankai& out);
 
 // ── 北西太平洋津波（category==DCR_CAT_NWPAC_TSUNAMI）詳細 ────────────────────
-//   国際向け（カムチャツカ・沿海州・台湾等）。地名は国内向けと違い azarashi も
-//   英語名のみ（`qzss_dcr_jma_coastal_region.py` に日本語版が存在しない）。
-//   ★発生可能性 0=「津波の可能性なし」が明示的な終了値＝国内津波と同じ状態バケツ。
+//   国際向け（カムチャツカ・沿海州・台湾等）。地名コードの名称表は英語名のみ。
 struct DcrNwPacTsunami {
     uint8_t  potential;         // 3bit: 0=可能性なし 1〜4=規模別 7=その他
     uint8_t  count;             // 有効件数（最大5）
@@ -255,9 +208,8 @@ struct DcrNwPacTsunami {
 bool dcr_nwpac_tsunami(const DcrReport& r, DcrNwPacTsunami& out);
 
 // ── 火山（category==DCR_CAT_VOLCANO）詳細 ────────────────────────────────────
-//   噴火警戒レベル・警戒範囲。★終了を表す専用コードは無いが、レベルが下がって
-//   「平常」相当に戻ることも同じキー（火山名）の状態更新として自然に表現できるため
-//   状態バケツとして扱う（2026-07-30 ユーザー判断）。
+//   噴火警戒レベル・警戒範囲。同じ火山名で継続的に更新される想定の情報で、
+//   レベルの終了を示す専用コードは無い（レベルが下がって「平常」相当に戻る形で表現される）。
 struct DcrVolcano {
     uint8_t  ambiguityOfActivityTime;  // 3bit: 活動時刻(actDay/actHour/actMin)のうち
                                        //   どこまでが有効かを示す（dcr_activity_time_ambiguity_name）
@@ -270,16 +222,15 @@ struct DcrVolcano {
 bool dcr_volcano(const DcrReport& r, DcrVolcano& out);
 
 // ── 降灰（category==DCR_CAT_ASHFALL）詳細 ────────────────────────────────────
-//   降灰予報。市町村ごとに「いつ頃・どの程度」を最大4件持つ。★終了コードは無いが
-//   火山と同様の理由で状態バケツ扱い（活動が続く限り同じ火山名で更新され続ける）。
+//   降灰予報。市町村ごとに「いつ頃・どの程度」を最大4件持つ。終了コードは無く、
+//   活動が続く限り同じ火山名で更新され続ける情報。
 struct DcrAshFall {
     uint8_t  actDay, actHour, actMin;   // 活動時刻
     uint8_t  warningType;               // 2bit: 1=速報 2=詳細
     uint16_t volcanoNameRaw;            // 12bit（dcr_volcano_name と共用の表）
     uint8_t  count;                     // 有効件数（最大4）
-    // 3bit: コード表ではなく**活動時刻(actDay/actHour/actMin)からの経過時間（単位=時）**
-    //   そのもの（一次資料 Ho・Effective Range 0/1-6）。名前解決は不要＝「Ho時間後」と
-    //   そのまま表示すればよい値（★以前「詳細未解読」としていたのは表と早合点した誤り）。
+    // 3bit: コード表ではなく活動時刻(actDay/actHour/actMin)からの経過時間（単位=時）そのもの。
+    //   名前解決は不要で「Ho時間後」とそのまま表示できる値。
     uint8_t  expectedTime[4];
     uint8_t  warningCodeRaw[4];         // 3bit（dcr_ash_fall_warning_code_name）
     uint32_t localGov[4];               // 23bit 市町村コード（dcr_local_government_name と共用）
@@ -287,7 +238,7 @@ struct DcrAshFall {
 bool dcr_ash_fall(const DcrReport& r, DcrAshFall& out);
 
 // ── 洪水（category==DCR_CAT_FLOOD）詳細 ──────────────────────────────────────
-//   ★警戒レベル 1=「警報解除」が明示的な終了値＝気象と同型の状態バケツ。
+//   ★警戒レベル 1=「警報解除」が明示的な終了値（継続中/解除済みの判定に使える）。
 //   予報地域コードは40bit（河川ごとの細かいコード体系）で uint32_t に収まらない
 //   ため uint64_t で持つ。
 struct DcrFlood {
@@ -298,10 +249,9 @@ struct DcrFlood {
 bool dcr_flood(const DcrReport& r, DcrFlood& out);
 
 // ── 台風（category==DCR_CAT_TYPHOON）詳細 ────────────────────────────────────
-//   座標を持つカテゴリ（震源・南海トラフ以外で唯一）。★終了コードは無いが、
-//   台風が消滅・温帯低気圧化するまで「継続する状況」であり、震源のような一発
-//   イベントではないため状態バケツ扱い（2026-07-30 ユーザー判断）。
-//   同一性キーは台風番号（1〜99・シーズン内でユニーク）。
+//   座標を持つカテゴリ（震源以外で唯一）。終了コードは無く、台風が消滅・
+//   温帯低気圧化するまで継続的に更新される情報。同一性キーは台風番号
+//   （1〜99・シーズン内でユニーク）。
 struct DcrTyphoon {
     uint8_t  refDay, refHour, refMin;  // 解析基点時刻
     uint8_t  refTimeType;              // 3bit: 1=実況 2=推定 3=予報
@@ -320,8 +270,7 @@ struct DcrTyphoon {
 bool dcr_typhoon(const DcrReport& r, DcrTyphoon& out);
 
 // ── 海上（category==DCR_CAT_MARINE）詳細 ───────────────────────────────────
-//   ★警報コード 0=「海上警報解除」が明示的な終了値＝気象と同型の状態バケツ。
-//   沿岸ドライバー・釣り・マリンスポーツ利用者にとって重要度の高い高波・強風情報。
+//   地方海上予報区ごとの高波・強風等の警報。警報コード 0 が「解除」の明示的な値。
 struct DcrMarine {
     uint8_t  count;          // 有効件数（最大8）
     uint8_t  code[8];        // 5bit: 0=解除 10〜23=警報種別 31=その他（dcr_marine_warning_code_name）
@@ -335,28 +284,27 @@ const char* dcr_classification_name(uint8_t rc);
 const char* dcr_category_name(uint8_t dc);
 const char* dcr_info_type_name(uint8_t it);         // 0=発表 1=訂正 2=取消
 const char* dcr_intensity_name(uint8_t v);          // 震度 4bit（EEW の予想震度・上限の 11 含む）
-// ★震度カテゴリ(3)の震度は **3bit の別表**。上の 4bit 表と取り違えると別の震度が出る。
+// 震度カテゴリ(3)の観測震度は **3bit の別表**。上の 4bit 表（EEW予想震度）とは値が別。
 const char* dcr_seismic_intensity_name(uint8_t v);  // 震度 3bit（観測震度）
 const char* dcr_prefecture_name(uint8_t code);      // 都道府県 6bit（47件）
 const char* dcr_tsunami_warning_name(uint8_t v);    // 津波警報コード 4bit
 const char* dcr_tsunami_height_name(uint8_t v);     // 津波の高さ 4bit
-const char* dcr_tsunami_region_name(uint16_t code); // 津波予報区 10bit（96件）
+const char* dcr_tsunami_region_name(uint16_t code); // 津波予報区 10bit（99件）
 const char* dcr_long_period_name(uint8_t v);        // 長周期地震動階級
 const char* dcr_eew_region_name(uint8_t code);      // EEW 対象地域（1〜80・80bitビットマップ用）
-// 震央地名（10bit・EEW と震源が共通で持つ「どこの地震か」）。表は dcr_epicenter_table.cpp。
-//   ★EEW は座標を持たないので、EEW における地名解決は**この関数が唯一の手段**になる。
+// 震央地名（10bit・EEW と震源が共通で持つ「どこの地震か」）。EEWは座標を持たないので、
+//   EEWにおける地名解決はこの関数が唯一の手段になる。表は dcr_epicenter_table.cpp。
 const char* dcr_epicenter_name(uint16_t code);
 // 防災上の留意事項（9bit・EEW/震源/津波/北西太平洋津波が 3 個ずつ持つ）。
-//   表は dcr_prevention_table.cpp（一次資料 Table 4.1.2-6 から機械転記・全 55 件）。
-//   ★この関数だけ**未知コードで nullptr を返す**（他は "?"）。仕様改版で新コードが
-//     送られ得ると一次資料に明記があり、そのとき呼び出し側が「留意事項コード=307」と
-//     数値を出せる余地を残すため。呼び出し側は null チェックが要る。
+//   表は dcr_prevention_table.cpp（一次資料 Table 4.1.2-6・全 55 件）。
+//   この関数だけ未知コードで nullptr を返す（他は "?"）。仕様改版で新コードが送られ
+//   得るため、呼び出し側は数値のフォールバック表示を用意し null チェックすること。
 const char* dcr_prevention_name(uint16_t code);
 const char* dcr_weather_state_name(uint8_t v);
 const char* dcr_weather_sub_name(uint8_t v);
 const char* dcr_weather_region_name(uint32_t code); // 府県予報区（75件）
 
-// ── 2026-07-30 追加：残り7カテゴリの名称テーブル ─────────────────────────────
+// ── 残り7カテゴリの名称テーブル ────────────────────────────────────────────
 const char* dcr_nankai_serial_code_name(uint8_t v);         // 南海トラフ情報種類（4bit）
 const char* dcr_tsunamigenic_potential_name(uint8_t v);     // 北西太平洋津波 発生可能性（3bit）
 const char* dcr_nwpac_tsunami_height_name(uint16_t v);      // 北西太平洋津波 高さ（9bit）
@@ -374,10 +322,8 @@ const char* dcr_typhoon_intensity_category_name(uint8_t v); // 台風 強さ階�
 const char* dcr_marine_warning_code_name(uint8_t v);        // 海上警報コード（5bit）
 const char* dcr_marine_forecast_region_name(uint16_t code); // 地方海上予報区（14bit・49件）
 
-// 通報1件の人間可読な1行要約（時刻は JST へ変換済み）。
-//   SD ログの補助・EPD 表示・シリアル出力で**同じ文面**を使うためにここに置く
-//   （各所で書き分けると表記が割れ、ログの突き合わせが面倒になる）。
-//   詳細デコーダのあるカテゴリは中身入り、無いカテゴリはカテゴリ名＋発令時刻。
+// 通報1件の人間可読な1行要約（時刻は JST へ変換済み）。ログ・シリアル出力・簡易表示に
+//   共通して使える。詳細デコーダのあるカテゴリは中身入り、無いカテゴリはカテゴリ名＋発令時刻。
 //   例: "震源 20:47 熊本県熊本地方 10km M4.4 (32.6000,130.7000)"
 void dcr_summary(const DcrReport& r, char* buf, size_t n);
 
@@ -391,15 +337,15 @@ const char* dcr_magnitude_text(uint8_t magRaw, char* buf, size_t n);
 //   月日をまたぐので単純な加算では足りない（23:30 UTC → 翌日 08:30 JST）。
 //   引数は in/out。month は日跨ぎ・月跨ぎの判定に使う（不要なら nullptr 可だが、
 //   その場合 day は 1〜31 の循環になり月末で誤る）。
-//   ★地震発生時刻（DcrEew/DcrHypocenter の otDay/otHour/otMin）にも月が無いので、
-//     同じ通報の報告時刻の月（r.month）を渡して変換すること。
+//   地震発生時刻（DcrEew/DcrHypocenter の otDay/otHour/otMin）にも月が無いので、
+//   同じ通報の報告時刻の月（r.month）を渡して変換すること。
 //   既知の限界: 電文に年が無いため閏年を判定できない。2月28日 15:00 UTC 以降だけ
 //   日付が1日ずれ得る（平年として扱う）。実用上は許容範囲と判断。
 void dcr_to_jst(uint8_t* month, uint8_t* day, uint8_t* hour, uint8_t* minute);
 
 // 内容キーを作る（dcr_decode が内部で呼び r.contentKey に入れる）。単体でも使える。
 //   材料 = 共通部（MT/カテゴリ/報告時刻/情報種別）＋ 詳細デコーダが有るカテゴリは
-//   その全フィールド。生バイトは一切混ぜない（それが不安定なのが今回の教訓）。
+//   その全フィールド。生バイトやCRC24は混ぜない（背景は docs/DECODER_NOTES.md）。
 uint32_t dcr_content_key(const DcrReport& r);
 
 // ── 低レベルユーティリティ（受信経路が PAB/MT の速判定に使う）───────────────
